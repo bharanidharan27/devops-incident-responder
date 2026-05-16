@@ -4,3 +4,7 @@ __pycache__/
 dev.db
 app/reports/*
 .chromadb/*
+.pytest_tmp/
+.devserver-*.log
+.devserver-pids.json
+.devserver-*.pid

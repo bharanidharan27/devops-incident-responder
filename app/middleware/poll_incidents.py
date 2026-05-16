@@ -1,31 +1,20 @@
-import sqlite3
 import time
 
-DB_FILE = "../db/dev.db"
-POLL_INTERVAL = 10  # check every 10 seconds
+from app.config import POLL_INTERVAL_SECONDS
+from app.db.dal import get_open_incidents, init_db
 
-def fetch_new_incidents(conn, last_seen_id):
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM incidents WHERE id > ? ORDER BY id ASC", (last_seen_id,))
-    rows = cursor.fetchall()
-    return rows
 
-def main():
-    conn = sqlite3.connect(DB_FILE)
-    last_seen_id = 0  # start from the beginning (change if you only want new ones)
-
-    print("🔎 Watching for new incidents... (Ctrl+C to stop)")
-
+def main() -> None:
+    init_db()
+    last_seen = 0
+    print("Watching for open incidents. Press Ctrl+C to stop.")
     while True:
-        new_incidents = fetch_new_incidents(conn, last_seen_id)
-        if new_incidents:
-            for row in new_incidents:
-                print("🚨 New Incident:", row)
-                last_seen_id = row[0]  # update last seen ID
-                incident = row[5] # payload json
-                # Feed incident to agent
-                
-        time.sleep(POLL_INTERVAL)
+        for incident in get_open_incidents():
+            if int(incident["id"]) > last_seen:
+                print("New open incident:", incident)
+                last_seen = int(incident["id"])
+        time.sleep(POLL_INTERVAL_SECONDS)
+
 
 if __name__ == "__main__":
     main()

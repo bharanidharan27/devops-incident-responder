@@ -1,32 +1,18 @@
-import os
-from openai import OpenAI
-import tiktoken
-from dotenv import load_dotenv
+import hashlib
+import math
+import re
 
-load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-def embed_chunks(chunks, model="text-embedding-3-small", max_tokens=7500):
-    enc = tiktoken.encoding_for_model(model)
-    embeddings = []
-    safe_chunks = []
+def _embed(text: str, dimensions: int = 384) -> list[float]:
+    vector = [0.0] * dimensions
+    for token in re.findall(r"[a-zA-Z0-9_./:-]+", text.lower()):
+        digest = hashlib.sha256(token.encode("utf-8")).digest()
+        bucket = int.from_bytes(digest[:4], "big") % dimensions
+        sign = 1.0 if digest[4] % 2 == 0 else -1.0
+        vector[bucket] += sign
+    norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+    return [value / norm for value in vector]
 
-    for chunk in chunks:
-        tokens = enc.encode(chunk)
 
-        if len(tokens) > max_tokens:
-            print(f"⚠️ Chunk too big ({len(tokens)} tokens) → splitting...")
-            start = 0
-            while start < len(tokens):
-                sub_tokens = tokens[start:start + max_tokens]
-                sub_text = enc.decode(sub_tokens)
-                resp = client.embeddings.create(model=model, input=sub_text)
-                embeddings.append(resp.data[0].embedding)
-                safe_chunks.append(sub_text)
-                start += max_tokens
-        else:
-            resp = client.embeddings.create(model=model, input=chunk)
-            embeddings.append(resp.data[0].embedding)
-            safe_chunks.append(chunk)
-
-    return embeddings, safe_chunks
+def embed_chunks(chunks: list[str]) -> tuple[list[list[float]], list[str]]:
+    return [_embed(chunk) for chunk in chunks], chunks

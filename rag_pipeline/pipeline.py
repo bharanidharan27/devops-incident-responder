@@ -1,8 +1,8 @@
-from loader import load_pdf
 from chunker import chunk_text
-from embedder import embed_chunks
-from pinecone_store import PineconeStore
 from clean_text import clean_text
+from embedder import embed_chunks
+from loader import load_pdf
+from pinecone_store import PineconeStore
 
 def build_rag_index(pdf_path: str):
     text = load_pdf(pdf_path)
