@@ -1,34 +1,48 @@
-# scripts/seed_incidents.py
-import os, json, datetime
-from sqlalchemy import create_engine, text
+from app.db.dal import init_db, record_incident
 
-DB_URL = os.environ.get("DB_URL", "sqlite:///dev.db")
-engine = create_engine(DB_URL, future=True)
 
-def iso_utc():
-    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+def seed_incidents() -> list[int]:
+    init_db()
+    samples = [
+        {
+            "service": "payment-service",
+            "environment": "prod",
+            "severity": "CRITICAL",
+            "title": "Checkout HTTP 500 spike",
+            "description": "Synthetic alert for checkout failures.",
+            "alert_type": "HTTP 500",
+            "source": "seed",
+            "external_id": "seed-payment-http-500",
+            "payload": {"details": "synthetic cloudwatch-like alert", "service": "payment-service"},
+        },
+        {
+            "service": "postgres",
+            "environment": "prod",
+            "severity": "HIGH",
+            "title": "Database connection refused",
+            "description": "Application cannot connect to postgres:5432.",
+            "alert_type": "db connection refused",
+            "source": "seed",
+            "external_id": "seed-db-conn-refused",
+            "payload": {"details": "connection refused to postgres:5432"},
+        },
+        {
+            "service": "payment-service",
+            "environment": "prod",
+            "severity": "HIGH",
+            "title": "Container OOMKilled",
+            "description": "Kubelet reported memory pressure for payment service.",
+            "alert_type": "OOMKilled",
+            "source": "seed",
+            "external_id": "seed-payment-oom",
+            "payload": {"details": "kubelet OOMKilled container payment-service"},
+        },
+    ]
+    ids = []
+    for sample in samples:
+        ids.append(record_incident(status="OPEN", **sample))
+    return ids
 
-def seed_one():
-    with engine.begin() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO incidents(status, service, environment, severity, payload_json, created_at)
-                VALUES(:status, :service, :env, :sev, :payload, :created_at)
-            """),
-            {
-                "status": "OPEN",
-                "service": "payment-service",
-                "env": "prod",
-                "sev": "CRITICAL",
-                "payload": json.dumps({
-                    "alert": "2025-09-27-seed",
-                    "details": "synthetic cloudwatch-like alert",
-                    "service": "payment-service"
-                }),
-                "created_at": iso_utc(),
-            }
-        )
 
 if __name__ == "__main__":
-    seed_one()
-    print("Seeded one incident.")
+    print("Seeded incidents:", ", ".join(str(item) for item in seed_incidents()))

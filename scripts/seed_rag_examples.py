@@ -1,2 +1,10 @@
-# Placeholder for seeding RAG examples (already included in app/rag/data/examples.jsonl)
-print('RAG examples present at app/rag/data/examples.jsonl')
+from app.rag.service import RagService
+
+
+def main() -> None:
+    result = RagService().reindex()
+    print(f"Indexed {result['documents']} knowledge chunks using {result['backend']}.")
+
+
+if __name__ == "__main__":
+    main()
