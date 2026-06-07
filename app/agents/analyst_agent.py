@@ -27,6 +27,27 @@ RULES = [
         "fix": ["Rollback the latest risky deploy", "Add null checks", "Improve input validation and regression tests"],
         "confidence": 0.76,
     },
+    {
+        "pattern": r"upstream_timeout|HTTP 504|p95_latency_ms|thread_pool saturated|request timed out",
+        "issue": "Latency and upstream timeout spike",
+        "root_cause": "A slow or saturated upstream dependency is causing checkout requests to time out",
+        "fix": ["Identify and scale the slow dependency", "Reduce retries and enable circuit breaker", "Temporarily bypass non-critical dependency calls"],
+        "confidence": 0.78,
+    },
+    {
+        "pattern": r"JWT validation failed|unknown signing key|signature verification failed|cached_jwks",
+        "issue": "JWT validation failures",
+        "root_cause": "Stale or invalid signing key material after identity provider key rotation",
+        "fix": ["Refresh JWKS cache", "Verify issuer/audience/key ID configuration", "Roll back key rotation if blast radius is high"],
+        "confidence": 0.8,
+    },
+    {
+        "pattern": r"queue backlog|visible_messages|oldest_age_seconds|consumer lag|worker_pool saturated",
+        "issue": "Queue backlog and consumer lag",
+        "root_cause": "Consumers are processing slower than producers are enqueueing work",
+        "fix": ["Scale consumer workers", "Check downstream throttling or deadlocks", "Pause non-critical producers until backlog drains"],
+        "confidence": 0.77,
+    },
 ]
 
 
