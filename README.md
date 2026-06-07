@@ -46,6 +46,7 @@ On Windows PowerShell, the API command is expected to keep running. Wait for `Uv
 - `GET /api/incidents/{id}/report`
 - `POST /api/incidents/{id}/run`
 - `POST /api/rag/reindex`
+- `POST /api/webhooks/alertmanager`
 
 Example incident:
 
@@ -121,3 +122,64 @@ Webhook incidents can override the default log group:
 ```
 
 If CloudWatch credentials or log groups are missing and `CLOUDWATCH_FALLBACK_TO_LOCAL=true`, the collector records a warning step and falls back to local sample logs.
+
+## Simulate Alertmanager + CloudWatch End-to-End
+
+Prometheus Alertmanager is open source and supports generic webhook receivers, which makes it the best free first integration path. PagerDuty can be added later as another webhook parser, but Alertmanager gives us a no-license route for real or simulated alerts.
+
+1. Configure `.env`:
+
+```env
+LOGS_MODE=cloudwatch
+AWS_PROFILE=default
+AWS_REGION=us-east-1
+CLOUDWATCH_LOG_GROUPS=/devops-incident-responder/payment-service
+CLOUDWATCH_STREAM_PREFIX=demo
+WEBHOOK_AUTO_PROCESS=true
+```
+
+2. Start the API:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn app.api:app --host 127.0.0.1 --port 8000 --reload --reload-dir app
+```
+
+3. Rebuild the local RAG index so the demo runbooks are available:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.rag.build_index
+```
+
+4. In another terminal, write demo logs into CloudWatch:
+
+```powershell
+.\.venv\Scripts\python.exe scripts/simulate_cloudwatch_logs.py --scenario http500 --log-group /devops-incident-responder/payment-service --stream-prefix demo
+```
+
+5. Send an Alertmanager-compatible webhook:
+
+```powershell
+.\.venv\Scripts\python.exe scripts/simulate_alertmanager_alert.py --scenario http500 --log-group /devops-incident-responder/payment-service --stream-prefix demo
+```
+
+The webhook creates the incident automatically. With `WEBHOOK_AUTO_PROCESS=true`, the API immediately runs the collector/analyst/supervisor flow, retrieves matching CloudWatch events, and writes the report.
+
+For a faster demo, omit `--scenario` to pick randomly:
+
+```powershell
+.\.venv\Scripts\python.exe scripts/simulate_cloudwatch_logs.py --log-group /devops-incident-responder/payment-service --stream-prefix demo
+.\.venv\Scripts\python.exe scripts/simulate_alertmanager_alert.py --log-group /devops-incident-responder/payment-service --stream-prefix demo
+```
+
+The CloudWatch simulator writes the selected scenario to `.demo_scenario`, and the Alertmanager simulator reads that file by default, so the two commands still match even when the scenario is random.
+
+Scenario options:
+
+- `http500`
+- `db`
+- `oom`
+- `latency`
+- `auth`
+- `queue`
+
+CloudWatch ingestion may create small AWS charges. The simulator sets a short retention policy by default using `CLOUDWATCH_SIMULATION_RETENTION_DAYS=1`.

@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from app.config import RAG_COLLECTION_NAME, RAG_PERSIST_DIR, VECTOR_BACKEND
+from app.config import BASE_DIR, RAG_COLLECTION_NAME, RAG_PERSIST_DIR, VECTOR_BACKEND
 from app.rag.loader import load_knowledge_documents
 from app.services.redaction import redact_text
 
@@ -14,14 +14,22 @@ FALLBACK_INDEX = "fallback_index.json"
 
 class RagService:
     def __init__(self, persist_dir: str = RAG_PERSIST_DIR, collection_name: str = RAG_COLLECTION_NAME) -> None:
-        self.persist_dir = Path(persist_dir)
+        self.persist_dir = self._writable_dir(Path(persist_dir))
         self.collection_name = collection_name
         self.persist_dir.mkdir(parents=True, exist_ok=True)
 
     def reindex(self) -> dict[str, Any]:
         docs = self._chunk_documents(load_knowledge_documents())
         if VECTOR_BACKEND.lower() == "chroma" and self._chroma_available():
-            return self._reindex_chroma(docs)
+            try:
+                return self._reindex_chroma(docs)
+            except Exception as exc:
+                fallback_error = self._try_write_fallback(docs)
+                return {
+                    "backend": "memory-vector" if fallback_error else "json-vector",
+                    "documents": len(docs),
+                    "fallback_reason": "; ".join(item for item in [str(exc), fallback_error] if item),
+                }
         self._write_fallback(docs)
         return {"backend": "json-vector", "documents": len(docs)}
 
@@ -38,7 +46,7 @@ class RagService:
         docs = self._read_fallback()
         if not docs:
             docs = self._chunk_documents(load_knowledge_documents())
-            self._write_fallback(docs)
+            self._try_write_fallback(docs)
         query_vector = self._embed(clean_query)
         scored = []
         for doc in docs:
@@ -126,6 +134,13 @@ class RagService:
         ]
         (self.persist_dir / FALLBACK_INDEX).write_text(json.dumps(serializable), encoding="utf-8")
 
+    def _try_write_fallback(self, docs: list[dict[str, Any]]) -> str | None:
+        try:
+            self._write_fallback(docs)
+        except Exception as exc:
+            return f"fallback index write failed: {exc}"
+        return None
+
     def _read_fallback(self) -> list[dict[str, Any]]:
         path = self.persist_dir / FALLBACK_INDEX
         if not path.exists():
@@ -157,3 +172,16 @@ class RagService:
 
     def _stable_id(self, value: str) -> str:
         return hashlib.sha1(value.encode("utf-8")).hexdigest()
+
+    def _writable_dir(self, path: Path) -> Path:
+        candidates = [path, BASE_DIR / ".rag_index"]
+        for candidate in candidates:
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+                probe = candidate / ".write_probe"
+                probe.write_text("ok", encoding="utf-8")
+                probe.unlink(missing_ok=True)
+                return candidate
+            except Exception:
+                continue
+        return path

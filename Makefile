@@ -2,7 +2,7 @@ PYTHON ?= python
 HOST ?= 127.0.0.1
 PORT ?= 8001
 
-.PHONY: api worker worker-once ui seed rag test clean
+.PHONY: api worker worker-once ui seed rag simulate-cloudwatch simulate-alert test clean
 
 api:
 	$(PYTHON) -m uvicorn app.api:app --reload --reload-dir app --host $(HOST) --port $(PORT)
@@ -23,6 +23,12 @@ seed:
 
 rag:
 	$(PYTHON) -m app.rag.build_index
+
+simulate-cloudwatch:
+	$(PYTHON) scripts/simulate_cloudwatch_logs.py
+
+simulate-alert:
+	$(PYTHON) scripts/simulate_alertmanager_alert.py
 
 test:
 	$(PYTHON) -m pytest -q

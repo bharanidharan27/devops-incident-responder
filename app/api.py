@@ -1,7 +1,9 @@
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 
+from app.config import WEBHOOK_AUTO_PROCESS
 from app.db.dal import (
     get_incident,
     get_latest_report,
@@ -94,3 +96,84 @@ def run_incident(incident_id: int) -> dict[str, object]:
 @app.post("/api/rag/reindex")
 def reindex_rag() -> dict[str, object]:
     return RagService().reindex()
+
+
+@app.post("/api/webhooks/alertmanager")
+def alertmanager_webhook(payload: dict[str, Any]) -> dict[str, object]:
+    alerts = payload.get("alerts") or []
+    if not isinstance(alerts, list):
+        raise HTTPException(status_code=400, detail="Alertmanager payload must include alerts[]")
+
+    created: list[dict[str, object]] = []
+    for index, alert in enumerate(alerts):
+        if not isinstance(alert, dict):
+            continue
+        if (alert.get("status") or payload.get("status")) == "resolved":
+            continue
+
+        incident_id = _record_alertmanager_alert(payload, alert, index)
+        report = process_incident(incident_id) if WEBHOOK_AUTO_PROCESS else None
+        created.append(
+            {
+                "incident_id": incident_id,
+                "auto_processed": WEBHOOK_AUTO_PROCESS,
+                "report_generated": report is not None,
+            }
+        )
+
+    return {"status": "accepted", "created": created, "count": len(created)}
+
+
+def _record_alertmanager_alert(payload: dict[str, Any], alert: dict[str, Any], index: int) -> int:
+    labels = {
+        **_dict(payload.get("commonLabels")),
+        **_dict(alert.get("labels")),
+    }
+    annotations = {
+        **_dict(payload.get("commonAnnotations")),
+        **_dict(alert.get("annotations")),
+    }
+    payload_details = {
+        "alertmanager": {
+            "receiver": payload.get("receiver"),
+            "groupKey": payload.get("groupKey"),
+            "externalURL": payload.get("externalURL"),
+            "alert": alert,
+        },
+        **_cloudwatch_overrides(labels, annotations),
+    }
+    severity = str(labels.get("severity") or "UNKNOWN").upper()
+    external_id = (
+        alert.get("fingerprint")
+        or labels.get("fingerprint")
+        or f"alertmanager:{payload.get('groupKey', 'group')}:{labels.get('alertname', 'alert')}:{alert.get('startsAt', index)}"
+    )
+    return record_incident(
+        status="OPEN",
+        service=labels.get("service") or labels.get("job") or labels.get("app") or "unknown",
+        environment=labels.get("environment") or labels.get("namespace") or "prod",
+        severity=severity,
+        title=annotations.get("summary") or labels.get("alertname") or "Alertmanager alert",
+        description=annotations.get("description") or "",
+        alert_type=labels.get("alertname") or "alertmanager",
+        source="alertmanager",
+        external_id=str(external_id),
+        payload=payload_details,
+    )
+
+
+def _dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _cloudwatch_overrides(labels: dict[str, Any], annotations: dict[str, Any]) -> dict[str, Any]:
+    merged = {**annotations, **labels}
+    keys = [
+        "cloudwatch_log_group",
+        "cloudwatch_log_groups",
+        "cloudwatch_log_stream_prefix",
+        "cloudwatch_filter_pattern",
+        "cloudwatch_start_time",
+        "cloudwatch_end_time",
+    ]
+    return {key: merged[key] for key in keys if merged.get(key)}
