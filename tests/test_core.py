@@ -1,6 +1,7 @@
 import os
 
 from app.db import dal
+from app.agents import collector_agent
 from app.runner import process_incident
 
 
@@ -59,3 +60,29 @@ def test_worker_processes_incident_with_rule_fallback(monkeypatch, tmp_path):
     assert dal.get_incident(incident_id)["status"] == "DONE"
     assert dal.get_latest_report(incident_id) is not None
     assert any(step["agent"] == "analyst" for step in dal.list_steps(incident_id))
+
+
+def test_collector_falls_back_to_local_when_cloudwatch_fails(monkeypatch, tmp_path):
+    use_temp_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(collector_agent, "LOGS_MODE", "cloudwatch")
+    monkeypatch.setattr(collector_agent, "CLOUDWATCH_FALLBACK_TO_LOCAL", True)
+
+    def fail_cloudwatch(*args, **kwargs):
+        raise RuntimeError("missing cloudwatch credentials")
+
+    monkeypatch.setattr(collector_agent, "fetch_cloudwatch_logs", fail_cloudwatch)
+    incident_id = dal.record_incident(
+        service="payment-service",
+        environment="prod",
+        severity="CRITICAL",
+        title="Checkout HTTP 500 spike",
+        alert_type="HTTP 500",
+        source="test",
+    )
+    incident = dal.get_incident(incident_id)
+
+    collected = collector_agent.collector_run(incident)
+
+    assert collected["fallback_reason"] == "missing cloudwatch credentials"
+    assert collected["logs"]
+    assert collected["logs"][0]["source"] == "local"

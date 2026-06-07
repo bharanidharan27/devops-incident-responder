@@ -12,6 +12,10 @@ Local-first incident triage product for DevOps/SRE workflows. It accepts manual 
 - Deterministic rule-based fallback when no AI provider is configured.
 - Streamlit UI for incident creation, timeline, evidence, RCA reports, and provider status.
 
+## Recommended Next Product Move
+
+CloudWatch is the right next integration if the target customer is AWS-based SRE/DevOps teams. Keep it as a source adapter, not a hard dependency: the app should still support manual/webhook intake and local demo logs so it remains easy to evaluate without AWS credentials.
+
 ## Quickstart
 
 ```bash
@@ -72,3 +76,48 @@ OLLAMA_ENABLED=false
 ```
 
 No code changes are required to switch providers. Hosted logs are redacted before they are sent to an AI provider.
+
+## CloudWatch Logs Setup
+
+Local seeded logs are still the default. To read from AWS CloudWatch Logs, configure `.env`:
+
+```env
+LOGS_MODE=cloudwatch
+AWS_REGION=us-east-1
+AWS_PROFILE=your-profile
+CLOUDWATCH_LOG_GROUPS=/aws/lambda/payment-service,/aws/ecs/checkout
+CLOUDWATCH_LOOKBACK_MINUTES=30
+CLOUDWATCH_MAX_EVENTS=100
+CLOUDWATCH_FALLBACK_TO_LOCAL=true
+```
+
+The AWS identity needs read-only CloudWatch Logs permissions:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "logs:FilterLogEvents",
+    "logs:DescribeLogGroups",
+    "logs:DescribeLogStreams"
+  ],
+  "Resource": "*"
+}
+```
+
+Webhook incidents can override the default log group:
+
+```json
+{
+  "service": "payment-service",
+  "severity": "CRITICAL",
+  "alert_type": "HTTP 500",
+  "payload": {
+    "cloudwatch_log_groups": ["/aws/lambda/payment-service"],
+    "cloudwatch_filter_pattern": "ERROR",
+    "cloudwatch_log_stream_prefix": "2026/05/16"
+  }
+}
+```
+
+If CloudWatch credentials or log groups are missing and `CLOUDWATCH_FALLBACK_TO_LOCAL=true`, the collector records a warning step and falls back to local sample logs.
