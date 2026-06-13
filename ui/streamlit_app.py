@@ -3,10 +3,17 @@ import json
 import pandas as pd
 import streamlit as st
 
-from app.db.dal import get_incident, get_latest_report, init_db, list_incidents, list_steps, record_incident
-from app.rag.service import RagService
-from app.runner import process_incident
-from app.services.ai_client import AIClient
+from app.config import API_BASE_URL
+from ui.api_client import IncidentApiClient, IncidentApiError
+
+
+def api_client() -> IncidentApiClient:
+    return IncidentApiClient(API_BASE_URL)
+
+
+def stop_on_api_error(exc: IncidentApiError) -> None:
+    st.error(f"API error: {exc}")
+    st.stop()
 
 
 NAV_ITEMS = [
@@ -906,7 +913,13 @@ def render_incident_table(incidents: list[dict], *, compact: bool) -> None:
 # ---------------------------------------------------------------------------
 
 def render_report_panel(incident_id: int, key_prefix: str) -> bool:
-    report = get_latest_report(incident_id)
+    try:
+        report = api_client().get_report(incident_id)
+    except IncidentApiError as exc:
+        if exc.status_code == 404:
+            report = None
+        else:
+            stop_on_api_error(exc)
     if not report:
         st.markdown(
             """
@@ -941,7 +954,14 @@ def render_report_panel(incident_id: int, key_prefix: str) -> bool:
 
 
 def render_incident_detail(incident_id: int) -> None:
-    incident = get_incident(incident_id)
+    client = api_client()
+    try:
+        incident = client.get_incident(incident_id)
+    except IncidentApiError as exc:
+        if exc.status_code == 404:
+            incident = None
+        else:
+            stop_on_api_error(exc)
     if not incident:
         st.warning("Incident not found")
         return
@@ -1000,7 +1020,11 @@ def render_incident_detail(incident_id: int) -> None:
     actions = st.columns([1, 1, 3])
     if actions[0].button(":material/play_arrow: Run now", type="primary", use_container_width=True, key=f"run_{incident_id}"):
         with st.spinner("Processing incident…"):
-            process_incident(incident_id)
+            try:
+                client.run_incident(incident_id)
+            except IncidentApiError as exc:
+                st.error(f"Incident processing failed: {exc}")
+                return
         st.rerun()
     if actions[1].button(":material/refresh: Refresh", use_container_width=True, key=f"refresh_{incident_id}"):
         st.rerun()
@@ -1009,7 +1033,10 @@ def render_incident_detail(incident_id: int) -> None:
     render_report_panel(incident_id, key_prefix="detail")
 
     detail_tabs = st.tabs(["Timeline", "Evidence", "Payload"])
-    steps = list_steps(incident_id)
+    try:
+        steps = client.list_steps(incident_id)
+    except IncidentApiError as exc:
+        stop_on_api_error(exc)
 
     with detail_tabs[0]:
         if steps:
@@ -1059,7 +1086,16 @@ def render_incident_detail(incident_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 def render_dashboard() -> None:
-    incidents = list_incidents(limit=200)
+    try:
+        incidents = api_client().list_incidents(limit=200)
+    except IncidentApiError as exc:
+        page_header(
+            eyebrow="Operations Â· Live",
+            title="Dashboard",
+            meta="api unavailable",
+        )
+        st.error(f"API unavailable: {exc}")
+        return
 
     # Pick up row clicks from anchor links (?incident_id=<id>)
     if "incident_id" in st.query_params:
@@ -1139,18 +1175,25 @@ def create_incident_form() -> None:
         submitted = st.form_submit_button("Create incident", type="primary", use_container_width=True)
 
     if submitted:
-        incident_id = record_incident(
-            status="OPEN",
-            service=service,
-            environment=environment,
-            severity=severity,
-            title=title,
-            description=description,
-            alert_type=alert_type,
-            source=source or "manual",
-            external_id=external_id or None,
-            payload=parse_payload(payload_raw),
-        )
+        try:
+            incident = api_client().create_incident(
+                {
+                    "service": service,
+                    "environment": environment,
+                    "severity": severity,
+                    "title": title,
+                    "description": description,
+                    "alert_type": alert_type,
+                    "source": source or "manual",
+                    "external_id": external_id or None,
+                    "payload": parse_payload(payload_raw),
+                }
+            )
+        except IncidentApiError as exc:
+            st.error(f"Incident was not created: {exc}")
+            return
+
+        incident_id = int(incident["id"])
         st.session_state["selected_incident_id"] = incident_id
         st.session_state["nav_key"] = "dashboard"
         st.success(f"Incident #{incident_id} created")
@@ -1162,15 +1205,26 @@ def create_incident_form() -> None:
 # ---------------------------------------------------------------------------
 
 def render_provider_panel() -> None:
-    status = AIClient().provider_status()
+    try:
+        health = api_client().provider_status()
+    except IncidentApiError as exc:
+        page_header(
+            eyebrow="Inference",
+            title="AI Providers",
+            meta="api unavailable",
+        )
+        st.error(f"API unavailable: {exc}")
+        return
+
+    status = health.get("ai", {})
     page_header(
         eyebrow="Inference",
         title="AI Providers",
-        meta=f"default · {status['default_model']}",
+        meta=f"api · {health.get('status', 'unknown')} · default · {status.get('default_model', 'unknown')}",
     )
 
     cards = []
-    for item in status["models"]:
+    for item in status.get("models", []):
         configured = item["configured"]
         dot_color = "var(--status-resolved)" if configured else "var(--text-muted)"
         glow = "0 0 8px rgba(61,220,151,0.45)" if configured else "none"
@@ -1200,7 +1254,11 @@ def render_provider_panel() -> None:
     )
     if st.button(":material/refresh: Rebuild knowledge base", type="primary"):
         with st.spinner("Reindexing knowledge base…"):
-            result = RagService().reindex()
+            try:
+                result = api_client().reindex_rag()
+            except IncidentApiError as exc:
+                st.error(f"Reindex failed: {exc}")
+                return
         st.success(f"Indexed {result['documents']} chunks via {result['backend']}")
 
 
@@ -1216,7 +1274,6 @@ def main() -> None:
         page_icon="🛰️",
     )
     inject_theme()
-    init_db()
 
     if "nav_key" not in st.session_state:
         st.session_state["nav_key"] = "dashboard"

@@ -1,12 +1,86 @@
 import datetime
 import json
-import sqlite3
+import os
 from pathlib import Path
 from typing import Any
 
-from app.config import DB_FILE
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    ForeignKey,
+    Index,
+    Integer,
+    MetaData,
+    Table,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    event,
+    insert,
+    select,
+    update,
+)
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 
-SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+from app.config import DATABASE_URL as CONFIG_DATABASE_URL
+from app.config import DB_FILE as CONFIG_DB_FILE
+
+DB_FILE = CONFIG_DB_FILE
+DATABASE_URL = CONFIG_DATABASE_URL
+DB_URL = CONFIG_DATABASE_URL
+
+metadata = MetaData()
+
+incidents = Table(
+    "incidents",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("external_id", Text, nullable=True),
+    Column("status", Text, nullable=False),
+    Column("service", Text, nullable=False),
+    Column("environment", Text, nullable=False),
+    Column("severity", Text, nullable=False),
+    Column("title", Text, nullable=False, default=""),
+    Column("description", Text, nullable=False, default=""),
+    Column("alert_type", Text, nullable=False, default=""),
+    Column("source", Text, nullable=False, default="manual"),
+    Column("payload_json", Text, nullable=False, default="{}"),
+    Column("created_at", Text, nullable=False),
+    Column("updated_at", Text, nullable=False),
+    CheckConstraint("status IN ('OPEN', 'IN_PROGRESS', 'DONE', 'FAILED')", name="ck_incidents_status"),
+    UniqueConstraint("external_id", name="uq_incidents_external_id"),
+)
+
+agent_steps = Table(
+    "agent_steps",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("incident_id", Integer, ForeignKey("incidents.id", ondelete="CASCADE"), nullable=False),
+    Column("agent", Text, nullable=False),
+    Column("phase", Text, nullable=False),
+    Column("message", Text, nullable=False),
+    Column("data_json", Text, nullable=False, default="{}"),
+    Column("ts", Text, nullable=False),
+    Column("status", Text, nullable=True),
+)
+
+reports = Table(
+    "reports",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("incident_id", Integer, ForeignKey("incidents.id", ondelete="CASCADE"), nullable=False),
+    Column("report_json", Text, nullable=False),
+    Column("report_md", Text, nullable=False),
+    Column("created_at", Text, nullable=False),
+)
+
+Index("idx_incidents_status", incidents.c.status, incidents.c.id)
+Index("idx_incidents_external_id", incidents.c.external_id)
+Index("idx_steps_inc_ts", agent_steps.c.incident_id, agent_steps.c.ts)
+Index("idx_reports_inc_dt", reports.c.incident_id, reports.c.created_at)
+
+_ENGINES: dict[str, Engine] = {}
 
 
 def _now_iso() -> str:
@@ -18,13 +92,68 @@ def _now_iso() -> str:
     )
 
 
-def _conn(rowdict: bool = False) -> sqlite3.Connection:
-    Path(DB_FILE).parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_FILE)
-    con.execute("PRAGMA foreign_keys = ON")
-    if rowdict:
-        con.row_factory = sqlite3.Row
-    return con
+def _sqlite_url_from_file(path: str) -> str:
+    sqlite_path = Path(path)
+    if not sqlite_path.is_absolute():
+        sqlite_path = Path.cwd() / sqlite_path
+    return f"sqlite:///{sqlite_path.as_posix()}"
+
+
+def _normalize_database_url(raw: str) -> str:
+    if raw.startswith("postgres://"):
+        return raw.replace("postgres://", "postgresql+psycopg://", 1)
+    if raw.startswith("postgresql://"):
+        return raw.replace("postgresql://", "postgresql+psycopg://", 1)
+    if raw.startswith("sqlite:///"):
+        sqlite_file = raw.removeprefix("sqlite:///")
+        if sqlite_file and sqlite_file != ":memory:":
+            return _sqlite_url_from_file(sqlite_file)
+    return raw
+
+
+def _database_url() -> str:
+    env_database_url = os.getenv("DATABASE_URL")
+    if env_database_url:
+        return _normalize_database_url(env_database_url)
+
+    if DB_FILE != CONFIG_DB_FILE:
+        return _sqlite_url_from_file(str(DB_FILE))
+
+    env_db_url = os.getenv("DB_URL")
+    if env_db_url:
+        return _normalize_database_url(env_db_url)
+
+    if DATABASE_URL and not DATABASE_URL.startswith("sqlite:///"):
+        return _normalize_database_url(DATABASE_URL)
+
+    return _sqlite_url_from_file(DB_FILE)
+
+
+def _engine() -> Engine:
+    url = _database_url()
+    engine = _ENGINES.get(url)
+    if engine:
+        return engine
+
+    kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
+    if url.startswith("sqlite:///"):
+        db_path = Path(url.removeprefix("sqlite:///"))
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        kwargs["connect_args"] = {"check_same_thread": False}
+
+    engine = create_engine(url, **kwargs)
+    if url.startswith("sqlite:///"):
+        _enable_sqlite_foreign_keys(engine)
+    _ENGINES[url] = engine
+    return engine
+
+
+def _enable_sqlite_foreign_keys(engine: Engine) -> None:
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys = ON")
+        cursor.close()
 
 
 def _json_loads(raw: str | None, default: Any) -> Any:
@@ -34,163 +163,12 @@ def _json_loads(raw: str | None, default: Any) -> Any:
         return default
 
 
-def _table_exists(con: sqlite3.Connection, table: str) -> bool:
-    row = con.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-        (table,),
-    ).fetchone()
-    return row is not None
-
-
-def _table_columns(con: sqlite3.Connection, table: str) -> dict[str, tuple[Any, ...]]:
-    rows = con.execute(f"PRAGMA table_info({table})").fetchall()
-    return {row[1]: row for row in rows}
-
-
-def _needs_incident_migration(con: sqlite3.Connection) -> bool:
-    if not _table_exists(con, "incidents"):
-        return False
-    columns = _table_columns(con, "incidents")
-    required = {
-        "id",
-        "external_id",
-        "status",
-        "service",
-        "environment",
-        "severity",
-        "title",
-        "description",
-        "alert_type",
-        "source",
-        "payload_json",
-        "created_at",
-        "updated_at",
-    }
-    if not required.issubset(columns):
-        return True
-    id_type = (columns["id"][2] or "").upper()
-    return "INTEGER" not in id_type
-
-
-def _rename_if_exists(con: sqlite3.Connection, table: str, suffix: str) -> str | None:
-    if not _table_exists(con, table):
-        return None
-    legacy_name = f"{table}_{suffix}"
-    con.execute(f"ALTER TABLE {table} RENAME TO {legacy_name}")
-    return legacy_name
-
-
-def _safe_int(value: Any) -> int | None:
-    try:
-        if value is None or value == "":
-            return None
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _migrate_legacy_schema(con: sqlite3.Connection) -> None:
-    suffix = "legacy_" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
-    legacy_incidents = _rename_if_exists(con, "incidents", suffix)
-    legacy_steps = _rename_if_exists(con, "agent_steps", suffix)
-    legacy_reports = _rename_if_exists(con, "reports", suffix)
-
-    con.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-    if not legacy_incidents:
-        return
-
-    id_map: dict[str, int] = {}
-    legacy_columns = list(_table_columns(con, legacy_incidents).keys())
-    rows = con.execute(f"SELECT * FROM {legacy_incidents}").fetchall()
-    for row in rows:
-        row_map = dict(zip(legacy_columns, row))
-        old_id = row_map.get("id")
-        now = _now_iso()
-        numeric_id = _safe_int(old_id)
-        columns = [
-            "status",
-            "service",
-            "environment",
-            "severity",
-            "title",
-            "description",
-            "alert_type",
-            "source",
-            "payload_json",
-            "created_at",
-            "updated_at",
-        ]
-        values: list[Any] = [
-            row_map.get("status") or "OPEN",
-            row_map.get("service") or "unknown",
-            row_map.get("environment") or "unknown",
-            row_map.get("severity") or "UNKNOWN",
-            row_map.get("title") or "",
-            row_map.get("description") or "",
-            row_map.get("alert_type") or "",
-            row_map.get("source") or "legacy",
-            row_map.get("payload_json") or "{}",
-            row_map.get("created_at") or now,
-            row_map.get("updated_at") or now,
-        ]
-        if numeric_id is not None:
-            columns.insert(0, "id")
-            values.insert(0, numeric_id)
-        placeholders = ",".join("?" for _ in columns)
-        cur = con.execute(
-            f"INSERT INTO incidents({','.join(columns)}) VALUES({placeholders})",
-            values,
-        )
-        new_id = numeric_id if numeric_id is not None else int(cur.lastrowid)
-        if old_id is not None:
-            id_map[str(old_id)] = new_id
-
-    if legacy_steps and id_map:
-        step_columns = list(_table_columns(con, legacy_steps).keys())
-        for row in con.execute(f"SELECT * FROM {legacy_steps}").fetchall():
-            row_map = dict(zip(step_columns, row))
-            new_incident_id = id_map.get(str(row_map.get("incident_id")))
-            if not new_incident_id:
-                continue
-            con.execute(
-                """INSERT INTO agent_steps(incident_id, agent, phase, message, data_json, ts, status)
-                   VALUES(?,?,?,?,?,?,?)""",
-                (
-                    new_incident_id,
-                    row_map.get("agent") or "legacy",
-                    row_map.get("phase") or "unknown",
-                    row_map.get("message") or "",
-                    row_map.get("data_json") or "{}",
-                    row_map.get("ts") or _now_iso(),
-                    row_map.get("status"),
-                ),
-            )
-
-    if legacy_reports and id_map:
-        report_columns = list(_table_columns(con, legacy_reports).keys())
-        for row in con.execute(f"SELECT * FROM {legacy_reports}").fetchall():
-            row_map = dict(zip(report_columns, row))
-            new_incident_id = id_map.get(str(row_map.get("incident_id")))
-            if not new_incident_id:
-                continue
-            con.execute(
-                """INSERT INTO reports(incident_id, report_json, report_md, created_at)
-                   VALUES(?,?,?,?)""",
-                (
-                    new_incident_id,
-                    row_map.get("report_json") or "{}",
-                    row_map.get("report_md") or "",
-                    row_map.get("created_at") or _now_iso(),
-                ),
-            )
+def _row_dict(row: Any) -> dict[str, Any]:
+    return dict(row._mapping)
 
 
 def init_db() -> None:
-    with _conn() as con:
-        if _needs_incident_migration(con):
-            _migrate_legacy_schema(con)
-        else:
-            con.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    metadata.create_all(_engine())
 
 
 def record_incident(
@@ -209,52 +187,43 @@ def record_incident(
 ) -> int:
     init_db()
     now = _now_iso()
-    with _conn() as con:
+    values: dict[str, Any] = {
+        "status": status,
+        "service": service,
+        "environment": environment,
+        "severity": severity,
+        "title": title,
+        "description": description,
+        "alert_type": alert_type,
+        "source": source,
+        "payload_json": json.dumps(payload or {}),
+        "created_at": created_at or now,
+        "updated_at": now,
+    }
+    if external_id:
+        values["external_id"] = external_id
+    if incident_id is not None:
+        values["id"] = incident_id
+
+    with _engine().begin() as con:
         if external_id:
             existing = con.execute(
-                "SELECT id FROM incidents WHERE external_id=?",
-                (external_id,),
-            ).fetchone()
-            if existing:
-                return int(existing[0])
-        columns = [
-            "status",
-            "service",
-            "environment",
-            "severity",
-            "title",
-            "description",
-            "alert_type",
-            "source",
-            "payload_json",
-            "created_at",
-            "updated_at",
-        ]
-        values: list[Any] = [
-            status,
-            service,
-            environment,
-            severity,
-            title,
-            description,
-            alert_type,
-            source,
-            json.dumps(payload or {}),
-            created_at or now,
-            now,
-        ]
-        if external_id:
-            columns.insert(0, "external_id")
-            values.insert(0, external_id)
-        if incident_id is not None:
-            columns.insert(0, "id")
-            values.insert(0, incident_id)
-        placeholders = ",".join("?" for _ in columns)
-        cur = con.execute(
-            f"INSERT INTO incidents({','.join(columns)}) VALUES({placeholders})",
-            values,
-        )
-        return int(incident_id if incident_id is not None else cur.lastrowid)
+                select(incidents.c.id).where(incidents.c.external_id == external_id)
+            ).scalar_one_or_none()
+            if existing is not None:
+                return int(existing)
+
+        try:
+            result = con.execute(insert(incidents).values(**values))
+        except IntegrityError:
+            if not external_id:
+                raise
+            existing = con.execute(
+                select(incidents.c.id).where(incidents.c.external_id == external_id)
+            ).scalar_one()
+            return int(existing)
+
+        return int(incident_id if incident_id is not None else result.inserted_primary_key[0])
 
 
 def record_step(
@@ -265,88 +234,131 @@ def record_step(
     data: dict[str, Any] | None = None,
     status: str | None = None,
 ) -> None:
-    with _conn() as con:
+    with _engine().begin() as con:
         con.execute(
-            """INSERT INTO agent_steps(incident_id, agent, phase, message, data_json, ts, status)
-               VALUES(?,?,?,?,?,?,?)""",
-            (incident_id, agent, phase, message, json.dumps(data or {}), _now_iso(), status),
+            insert(agent_steps).values(
+                incident_id=incident_id,
+                agent=agent,
+                phase=phase,
+                message=message,
+                data_json=json.dumps(data or {}),
+                ts=_now_iso(),
+                status=status,
+            )
         )
 
 
 def save_report(incident_id: int, report_json: dict[str, Any], report_md: str) -> None:
-    with _conn() as con:
+    with _engine().begin() as con:
         con.execute(
-            """INSERT INTO reports(incident_id, report_json, report_md, created_at)
-               VALUES(?,?,?,?)""",
-            (incident_id, json.dumps(report_json), report_md, _now_iso()),
+            insert(reports).values(
+                incident_id=incident_id,
+                report_json=json.dumps(report_json),
+                report_md=report_md,
+                created_at=_now_iso(),
+            )
         )
 
 
 def list_incidents(limit: int = 200) -> list[dict[str, Any]]:
-    sql = """SELECT id, external_id, status, service, environment, severity, title,
-                    alert_type, source, created_at, updated_at
-             FROM incidents ORDER BY id DESC LIMIT ?"""
-    with _conn(rowdict=True) as con:
-        rows = con.execute(sql, (limit,)).fetchall()
-    return [dict(r) for r in rows]
+    statement = (
+        select(
+            incidents.c.id,
+            incidents.c.external_id,
+            incidents.c.status,
+            incidents.c.service,
+            incidents.c.environment,
+            incidents.c.severity,
+            incidents.c.title,
+            incidents.c.alert_type,
+            incidents.c.source,
+            incidents.c.created_at,
+            incidents.c.updated_at,
+        )
+        .order_by(incidents.c.id.desc())
+        .limit(limit)
+    )
+    with _engine().connect() as con:
+        rows = con.execute(statement).fetchall()
+    return [_row_dict(row) for row in rows]
 
 
 def get_incident(incident_id: int) -> dict[str, Any] | None:
-    with _conn(rowdict=True) as con:
-        row = con.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
+    with _engine().connect() as con:
+        row = con.execute(select(incidents).where(incidents.c.id == incident_id)).fetchone()
     if not row:
         return None
-    incident = dict(row)
+    incident = _row_dict(row)
     incident["payload"] = _json_loads(incident.pop("payload_json", "{}"), {})
     return incident
 
 
 def list_steps(incident_id: int) -> list[dict[str, Any]]:
-    sql = """SELECT id, agent, phase, status, message, ts, data_json
-             FROM agent_steps WHERE incident_id=? ORDER BY id ASC"""
-    with _conn(rowdict=True) as con:
-        rows = con.execute(sql, (incident_id,)).fetchall()
-    out: list[dict[str, Any]] = []
+    statement = (
+        select(
+            agent_steps.c.id,
+            agent_steps.c.agent,
+            agent_steps.c.phase,
+            agent_steps.c.status,
+            agent_steps.c.message,
+            agent_steps.c.ts,
+            agent_steps.c.data_json,
+        )
+        .where(agent_steps.c.incident_id == incident_id)
+        .order_by(agent_steps.c.id.asc())
+    )
+    with _engine().connect() as con:
+        rows = con.execute(statement).fetchall()
+    output: list[dict[str, Any]] = []
     for row in rows:
-        item = dict(row)
+        item = _row_dict(row)
         item["data"] = _json_loads(item.pop("data_json", "{}"), {})
-        out.append(item)
-    return out
+        output.append(item)
+    return output
 
 
 def get_latest_report(incident_id: int) -> dict[str, Any] | None:
-    sql = """SELECT id, report_json, report_md, created_at
-             FROM reports WHERE incident_id=? ORDER BY id DESC LIMIT 1"""
-    with _conn(rowdict=True) as con:
-        row = con.execute(sql, (incident_id,)).fetchone()
+    statement = (
+        select(reports.c.id, reports.c.report_json, reports.c.report_md, reports.c.created_at)
+        .where(reports.c.incident_id == incident_id)
+        .order_by(reports.c.id.desc())
+        .limit(1)
+    )
+    with _engine().connect() as con:
+        row = con.execute(statement).fetchone()
     if not row:
         return None
-    report = dict(row)
+    report = _row_dict(row)
     report["report"] = _json_loads(report.pop("report_json", "{}"), {})
     return report
 
 
 def get_open_incidents(limit: int | None = None) -> list[dict[str, Any]]:
-    sql = "SELECT * FROM incidents WHERE status='OPEN' ORDER BY id ASC"
-    params: tuple[Any, ...] = ()
+    statement = (
+        select(incidents)
+        .where(incidents.c.status == "OPEN")
+        .order_by(incidents.c.id.asc())
+    )
     if limit is not None:
-        sql += " LIMIT ?"
-        params = (limit,)
-    with _conn(rowdict=True) as con:
-        rows = con.execute(sql, params).fetchall()
-    incidents = []
+        statement = statement.limit(limit)
+
+    with _engine().connect() as con:
+        rows = con.execute(statement).fetchall()
+
+    output = []
     for row in rows:
-        incident = dict(row)
+        incident = _row_dict(row)
         incident["payload"] = _json_loads(incident.pop("payload_json", "{}"), {})
-        incidents.append(incident)
-    return incidents
+        output.append(incident)
+    return output
 
 
 def update_status(incident_id: int, status: str) -> None:
-    with _conn() as con:
+    with _engine().begin() as con:
         con.execute(
-            "UPDATE incidents SET status=?, updated_at=? WHERE id=?",
-            (status, _now_iso(), incident_id),
+            update(incidents)
+            .where(incidents.c.id == incident_id)
+            .values(status=status, updated_at=_now_iso())
         )
 
 

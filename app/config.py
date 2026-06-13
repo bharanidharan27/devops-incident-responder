@@ -36,9 +36,14 @@ def _resolve_path(raw: str) -> str:
 ENV = os.getenv("ENV", "dev")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "10"))
 
-_db_url = os.getenv("DB_URL", "sqlite:///dev.db")
-DB_FILE = _resolve_path(os.getenv("DB_FILE") or _sqlite_file_from_url(_db_url) or "dev.db")
-DB_URL = f"sqlite:///{DB_FILE}"
+_configured_database_url = os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "sqlite:///dev.db"
+_configured_sqlite_file = _sqlite_file_from_url(_configured_database_url)
+DB_FILE = _resolve_path(os.getenv("DB_FILE") or _configured_sqlite_file or "dev.db")
+if _configured_sqlite_file is not None:
+    DATABASE_URL = f"sqlite:///{Path(DB_FILE).as_posix()}"
+else:
+    DATABASE_URL = _configured_database_url
+DB_URL = DATABASE_URL
 
 VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "chroma")
 RAG_COLLECTION_NAME = os.getenv("RAG_COLLECTION_NAME", "incident_playbooks")
@@ -80,5 +85,5 @@ CLOUDWATCH_SIMULATION_RETENTION_DAYS = int(os.getenv("CLOUDWATCH_SIMULATION_RETE
 WEBHOOK_AUTO_PROCESS = _bool_env("WEBHOOK_AUTO_PROCESS", True)
 
 API_HOST = os.getenv("API_HOST", "127.0.0.1")
-API_PORT = int(os.getenv("API_PORT", "8001"))
+API_PORT = int(os.getenv("API_PORT", "8000"))
 API_BASE_URL = os.getenv("API_BASE_URL", f"http://{API_HOST}:{API_PORT}")

@@ -37,6 +37,145 @@ The app works without OpenAI credentials. If no free hosted or local provider is
 
 On Windows PowerShell, the API command is expected to keep running. Wait for `Uvicorn running on http://127.0.0.1:8000`; press `Ctrl+C` only when you want to stop it.
 
+## Docker
+
+The repository builds one image that can run either the FastAPI server or the Streamlit UI. FastAPI owns database access and incident processing; Streamlit calls FastAPI through `API_BASE_URL`.
+
+```bash
+docker build -t devops-incident-responder .
+docker network create incident-responder
+
+docker run --rm --name incident-api --network incident-responder -p 8000:8000 `
+  -e PORT=8000 `
+  devops-incident-responder scripts/start_api.sh
+
+docker run --rm --name incident-ui --network incident-responder -p 8501:8501 `
+  -e API_BASE_URL=http://incident-api:8000 `
+  devops-incident-responder scripts/start_streamlit.sh
+```
+
+For local Docker without `DATABASE_URL`, the API uses SQLite at `/data/dev.db`. For AWS, set `DATABASE_URL` to the RDS PostgreSQL URL.
+
+## AWS ECS + RDS Deployment
+
+The recommended AWS deployment is ECS Fargate with one task running two containers from the same ECR image:
+
+- `api`: FastAPI on container port `8000`, command `scripts/start_api.sh`.
+- `ui`: Streamlit on container port `8501`, command `scripts/start_streamlit.sh`.
+- Application Load Balancer routes `/api/*`, `/health`, `/docs`, and `/openapi.json` to `api`; default traffic goes to `ui`.
+- RDS PostgreSQL stores incidents, agent steps, and reports. Store the SQLAlchemy URL in Secrets Manager as `DATABASE_URL`.
+
+Default values used below:
+
+```powershell
+$Region = "us-east-1"
+$App = "devops-incident-responder"
+$DbName = "incident_responder"
+$AccountId = aws sts get-caller-identity --query Account --output text
+```
+
+### 1. Build and Push the Image
+
+```powershell
+aws ecr create-repository --repository-name $App --region $Region
+aws ecr get-login-password --region $Region | docker login --username AWS --password-stdin "$AccountId.dkr.ecr.$Region.amazonaws.com"
+
+docker build -t "${App}:latest" .
+docker tag "${App}:latest" "$AccountId.dkr.ecr.$Region.amazonaws.com/${App}:latest"
+docker push "$AccountId.dkr.ecr.$Region.amazonaws.com/${App}:latest"
+```
+
+### 2. Create RDS PostgreSQL and Store the Secret
+
+Create a PostgreSQL RDS instance in the same VPC/subnets as ECS. The app expects a SQLAlchemy-compatible URL:
+
+```text
+postgresql+psycopg://<db-user>:<db-password>@<rds-endpoint>:5432/incident_responder
+```
+
+Store it in Secrets Manager:
+
+```powershell
+$DatabaseUrlSecretArn = aws secretsmanager create-secret `
+  --name "$App/database-url" `
+  --secret-string "postgresql+psycopg://<db-user>:<db-password>@<rds-endpoint>:5432/$DbName" `
+  --query ARN `
+  --output text `
+  --region $Region
+```
+
+### 3. Register the ECS Task Definition
+
+Copy `deploy/aws/ecs-task-definition.example.json`, replace `<account-id>`, `<database-url-secret-arn>`, and any region/image values, then register it:
+
+```powershell
+aws logs create-log-group --log-group-name "/ecs/$App" --region $Region
+aws ecs register-task-definition --cli-input-json file://deploy/aws/ecs-task-definition.example.json --region $Region
+```
+
+The ECS task execution role must be able to pull from ECR, write CloudWatch Logs, and read the Secrets Manager secret.
+
+### 4. Create ALB Target Groups and Listener Rules
+
+Create two target groups with target type `ip`:
+
+```powershell
+$VpcId = "<vpc-id>"
+
+$ApiTargetGroupArn = aws elbv2 create-target-group `
+  --name "$App-api" `
+  --protocol HTTP `
+  --port 8000 `
+  --vpc-id $VpcId `
+  --target-type ip `
+  --health-check-path /health `
+  --query "TargetGroups[0].TargetGroupArn" `
+  --output text `
+  --region $Region
+
+$UiTargetGroupArn = aws elbv2 create-target-group `
+  --name "$App-ui" `
+  --protocol HTTP `
+  --port 8501 `
+  --vpc-id $VpcId `
+  --target-type ip `
+  --health-check-path /_stcore/health `
+  --query "TargetGroups[0].TargetGroupArn" `
+  --output text `
+  --region $Region
+```
+
+Create an internet-facing ALB and HTTP listener. Set the listener default action to `$UiTargetGroupArn`, then add an API rule:
+
+```powershell
+aws elbv2 create-rule `
+  --listener-arn "<listener-arn>" `
+  --priority 10 `
+  --conditions Field=path-pattern,Values="/api/*","/health","/docs","/openapi.json" `
+  --actions Type=forward,TargetGroupArn=$ApiTargetGroupArn `
+  --region $Region
+```
+
+### 5. Create the ECS Service
+
+Use private subnets when you have NAT, or public subnets with `assignPublicIp=ENABLED` for the first low-friction deployment. The RDS security group must allow inbound PostgreSQL `5432` from the ECS task security group.
+
+```powershell
+aws ecs create-cluster --cluster-name $App --region $Region
+
+aws ecs create-service `
+  --cluster $App `
+  --service-name $App `
+  --task-definition $App `
+  --desired-count 1 `
+  --launch-type FARGATE `
+  --network-configuration "awsvpcConfiguration={subnets=[<subnet-a>,<subnet-b>],securityGroups=[<ecs-security-group>],assignPublicIp=ENABLED}" `
+  --load-balancers "targetGroupArn=$ApiTargetGroupArn,containerName=api,containerPort=8000" "targetGroupArn=$UiTargetGroupArn,containerName=ui,containerPort=8501" `
+  --region $Region
+```
+
+When deployment stabilizes, open the ALB DNS name. The UI should load Streamlit, and `/health` should return the FastAPI health payload.
+
 ## API
 
 - `POST /api/incidents`
