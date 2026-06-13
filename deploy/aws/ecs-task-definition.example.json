@@ -1,0 +1,80 @@
+{
+  "family": "devops-incident-responder",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::<account-id>:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "<account-id>.dkr.ecr.us-east-1.amazonaws.com/devops-incident-responder:latest",
+      "essential": true,
+      "command": ["scripts/start_api.sh"],
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "ENV",
+          "value": "prod"
+        },
+        {
+          "name": "LOGS_MODE",
+          "value": "local"
+        },
+        {
+          "name": "RAG_PERSIST_DIR",
+          "value": "/data/rag_index"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "DATABASE_URL",
+          "valueFrom": "<database-url-secret-arn>"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/devops-incident-responder",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "api"
+        }
+      }
+    },
+    {
+      "name": "ui",
+      "image": "<account-id>.dkr.ecr.us-east-1.amazonaws.com/devops-incident-responder:latest",
+      "essential": true,
+      "command": ["scripts/start_streamlit.sh"],
+      "portMappings": [
+        {
+          "containerPort": 8501,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "ENV",
+          "value": "prod"
+        },
+        {
+          "name": "API_BASE_URL",
+          "value": "http://127.0.0.1:8000"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/devops-incident-responder",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ui"
+        }
+      }
+    }
+  ]
+}

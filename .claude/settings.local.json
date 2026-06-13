@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(curl -sf http://localhost:8765/_stcore/health)"
+    ]
+  }
+}

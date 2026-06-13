@@ -1,6 +1,6 @@
 PYTHON ?= python
 HOST ?= 127.0.0.1
-PORT ?= 8001
+PORT ?= 8000
 
 .PHONY: api worker worker-once ui seed rag simulate-cloudwatch simulate-alert test clean
 
